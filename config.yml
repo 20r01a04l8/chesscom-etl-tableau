@@ -4,7 +4,7 @@ usernames:
   # add more usernames e.g. - yourusername
 sheet_names:
   # map username to spreadsheet title (optional). If not provided, default "chess_{username}_games" used.
-  # erik: "chess_erik_games"
+  konduvinay: "chess_com_games"
 run_frequency: "daily"
 polite_delay: 0.5
 max_archives: null   # set an int to limit number of archives fetched during testing, or null for all
