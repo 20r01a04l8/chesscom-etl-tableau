@@ -2,7 +2,7 @@ name: Scheduled Chess ETL
 
 on:
   schedule:
-    - cron: "0 1 * * *"   # daily at 01:00 UTC; change if needed
+    - cron: "*/10 * * * *"   # every 10 minutes (UTC)
   workflow_dispatch:
 
 permissions:
@@ -33,7 +33,10 @@ jobs:
         run: |
           echo "$GC_SA_JSON" > service-account.json
 
-      - name: Run ETL script
+      - name: Run ETL script (recent-only)
+        env:
+          RECENT_WINDOW_SECONDS: 600   # 10 minutes (overridden by env if set)
+          AUTO_SHARE_PERSONAL_EMAIL: ${{ secrets.AUTO_SHARE_PERSONAL_EMAIL || '' }}
         run: |
           python etl_script.py --config config.yml --state state.json --service-account service-account.json
 
