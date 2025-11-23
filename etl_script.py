@@ -171,7 +171,6 @@ def flatten_game(g: Dict[str, Any]) -> Dict[str, Any]:
         "black": black.get("username"),
         "white_rating": white.get("rating"),
         "black_rating": black.get("rating"),
-        "moves": pgn,
         "move_count": len(pgn.split()) if pgn else None,
         "result": result,
         "eco": g.get("eco"),
@@ -219,7 +218,7 @@ def main(argv=None):
     parser.add_argument("--max-archives", type=int, default=None, help="Limit number of archives to fetch (for testing)")
     args = parser.parse_args(argv)
 
-     cfg = load_config(args.config)
+    cfg = load_config(args.config)
 
     # -- validate cfg is a dict
     if not isinstance(cfg, dict):
@@ -269,7 +268,7 @@ def main(argv=None):
             logger.info(f"Wrote local CSV backup: {csv_path} ({len(df)} rows).")
 
             # upload to Google Sheets (append only)
-            sheet_title = (sheet_map or {}).get(username)
+            sheet_title = sheet_map.get(username)
             sh, ws = ensure_spreadsheet_for_user(gc, username, sheet_title)
             appended = append_new_games_to_sheet(ws, df)
 
