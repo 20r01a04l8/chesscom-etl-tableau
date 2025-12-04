@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-fetch_and_post.py — Incremental fetcher for Chess.com archives (Make removed).
+fetch_and_post.py — Incremental fetcher for Chess.com archives that writes to Google Sheets.
 
-Behavior changes:
-- No Make / webhook posting.
-- For each archive that contains new games, saves a JSON file to:
-    outputs/<username>/<archive_name>.json
-  where <archive_name> is the last path segment of the archive URL (e.g. 2025/11).
-- Persists state (processed_archives + last_end_time) after each archive.
-- Respects Chess.com politeness: delay between requests, exponential backoff for 429/5xx.
-- Dry-run concept removed; instead data is always saved locally to outputs.
+Requirements:
+  pip install requests gspread google-auth
+
+How it writes to Sheets:
+- Uses a service account JSON file path provided via env GSPREAD_SA_JSON_PATH (recommended)
+  or via secret `GSPREAD_SERVICE_ACCOUNT_JSON_B64` decoded in the Action (workflow does that).
+- SHEET_ID env var must be set (the Google Sheet ID).
+- For each username, it writes rows into a worksheet named by `SHEET_NAME_PREFIX + username`
+  (if SHEET_NAME_PREFIX is empty, uses the username as sheet title).
+- If the worksheet doesn't exist it is created and the header row (SHEET_COLS) is written.
 """
 
 from __future__ import annotations
@@ -17,19 +19,27 @@ import os
 import sys
 import time
 import json
+import base64
 import requests
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+# gspread / google auth
+import gspread
+from google.oauth2 import service_account
 
 # === CONFIG (change as needed) ===
 DEFAULT_USER_AGENT = "ChessAnalytics/1.0 (+your-email@example.com)"  # change email
 USER_AGENT = os.environ.get("MAKE_USER_AGENT", DEFAULT_USER_AGENT)
 DELAY = float(os.environ.get("CHESS_REQUEST_DELAY", "1.0"))         # seconds between chess.com requests
 MAX_RETRIES = int(os.environ.get("CHESS_MAX_RETRIES", "3"))
-STATE_FILE = os.environ.get("STATE_FILE", "state.json")            # path to state file (repo root)
+STATE_FILE = os.environ.get("STATE_FILE", "state.json")
+GSPREAD_SA_JSON_PATH = os.environ.get("GSPREAD_SA_JSON_PATH", "")   # e.g. ./sa.json (workflow writes this)
+SHEET_ID = os.environ.get("SHEET_ID", "")                          # required
+SHEET_NAME_PREFIX = os.environ.get("SHEET_NAME_PREFIX", "")        # optional prefix for worksheet names
 
-# Columns (must match your downstream target headers if you later import)
+# Columns (must match your downstream target headers)
 SHEET_COLS = [
     "ingest_time", "username", "archive_url", "game_url", "time_control",
     "end_time_utc", "date_ymd", "white_username", "white_rating",
@@ -122,32 +132,69 @@ def convert_game_to_obj(username: str, archive_url: str, game: Dict[str, Any]) -
     return {SHEET_COLS[i]: row[i] for i in range(len(SHEET_COLS))}
 
 def archive_name_from_url(url: str) -> str:
-    # take last segment of URL and sanitize
     name = url.rstrip("/").split("/")[-1]
-    # replace any characters that might be problematic in filenames
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
 
-def save_rows_to_file(username: str, archive_url: str, rows: List[Dict[str, Any]]) -> str:
+# --- Google Sheets helpers ---
+def _load_service_account_info() -> Dict[str, Any]:
     """
-    Save rows (list of objects) to outputs/<username>/<archive_name>.json
-    Returns the path where data was saved.
+    Loads service account info either from a file path (GSPREAD_SA_JSON_PATH)
+    or from env var GSPREAD_SERVICE_ACCOUNT_JSON_B64 (base64) if provided.
+    Workflow already writes a file; prefer that.
     """
-    archive_name = archive_name_from_url(archive_url)
-    out_dir = Path("outputs") / username
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{archive_name}.json"
-    data = {
-        "username": username,
-        "archive_url": archive_url,
-        "game_count": len(rows),
-        "rows": rows,
-        "generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    }
+    if GSPREAD_SA_JSON_PATH and Path(GSPREAD_SA_JSON_PATH).exists():
+        return json.loads(Path(GSPREAD_SA_JSON_PATH).read_text(encoding="utf-8"))
+    # fallback: try env var (raw JSON)
+    b64 = os.environ.get("GSPREAD_SERVICE_ACCOUNT_JSON_B64", "")
+    if b64:
+        try:
+            raw = base64.b64decode(b64)
+            return json.loads(raw)
+        except Exception as e:
+            raise RuntimeError(f"Failed to decode GSPREAD_SERVICE_ACCOUNT_JSON_B64: {e}")
+    raise RuntimeError("Service account JSON not found. Set GSPREAD_SA_JSON_PATH or GSPREAD_SERVICE_ACCOUNT_JSON_B64")
+
+def get_gspread_client() -> gspread.Client:
+    if not SHEET_ID:
+        raise RuntimeError("SHEET_ID env var is not set")
+    sa_info = _load_service_account_info()
+    creds = service_account.Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    )
+    client = gspread.authorize(creds)
+    return client
+
+def ensure_worksheet(spreadsheet: gspread.Spreadsheet, worksheet_name: str) -> gspread.Worksheet:
     try:
-        atomic_write_json(str(out_path), data)
-        return str(out_path)
-    except Exception as e:
-        raise RuntimeError(f"Failed to write output file {out_path}: {e}")
+        ws = spreadsheet.worksheet(worksheet_name)
+        # check header
+        existing = ws.row_values(1)
+        if not existing or existing[: len(SHEET_COLS)] != SHEET_COLS:
+            # overwrite header row to match expected columns
+            ws.resize(rows=1)
+            ws.append_row(SHEET_COLS, value_input_option="RAW")
+        return ws
+    except gspread.WorksheetNotFound:
+        # create with a reasonable row/col size
+        ws = spreadsheet.add_worksheet(title=worksheet_name, rows="1000", cols=str(len(SHEET_COLS)))
+        ws.append_row(SHEET_COLS, value_input_option="RAW")
+        return ws
+
+def append_rows_to_sheet(username: str, rows_objs: List[Dict[str, Any]]) -> None:
+    if not rows_objs:
+        return
+    client = get_gspread_client()
+    spreadsheet = client.open_by_key(SHEET_ID)
+    worksheet_name = f"{SHEET_NAME_PREFIX}{username}" if SHEET_NAME_PREFIX else username
+    ws = ensure_worksheet(spreadsheet, worksheet_name)
+    # convert list of dicts into list of lists in correct order
+    rows_data = []
+    for obj in rows_objs:
+        rows_data.append([obj.get(c, "") for c in SHEET_COLS])
+    # Use append_rows for batch append
+    # gspread append_rows will add rows after the last row
+    ws.append_rows(rows_data, value_input_option="USER_ENTERED")
 
 # === Main logic ===
 def fetch_and_post(usernames_csv: str) -> None:
@@ -156,11 +203,6 @@ def fetch_and_post(usernames_csv: str) -> None:
         raise SystemExit("No usernames provided.")
 
     state = load_state()
-    # state structure per user:
-    # state[username] = {
-    #    "last_end_time": 0,
-    #    "processed_archives": [archive_url,...]
-    # }
     for username in usernames:
         user_state = state.get(username, {})
         last_end_time = int(user_state.get("last_end_time", 0))
@@ -179,7 +221,6 @@ def fetch_and_post(usernames_csv: str) -> None:
 
         # Process archives in chronological order (older -> newer)
         for archive in archives:
-            # Skip if archive already processed
             if archive in processed_archives:
                 continue
 
@@ -189,16 +230,13 @@ def fetch_and_post(usernames_csv: str) -> None:
                 archive_json = safe_get_json(archive)
             except Exception as e:
                 print(f"[ERROR] Failed to download {archive}: {e}")
-                # Do not mark processed — try again next run
                 continue
 
             games = archive_json.get("games", []) or []
-            # Gather games that are newer than last_end_time
             new_games = []
             for g in games:
                 et = g.get("end_time")
                 if et is None:
-                    # if no end_time treat as new (edge case)
                     new_games.append(g)
                 else:
                     try:
@@ -209,9 +247,7 @@ def fetch_and_post(usernames_csv: str) -> None:
 
             if not new_games:
                 print(f"No new games in archive (marking processed): {archive}")
-                # mark archive processed (no new games)
                 processed_archives.add(archive)
-                # update state and persist
                 state[username] = {
                     "last_end_time": last_end_time,
                     "processed_archives": sorted(list(processed_archives))
@@ -219,25 +255,34 @@ def fetch_and_post(usernames_csv: str) -> None:
                 save_state(state)
                 continue
 
-            # Sort new_games ascending by end_time so we save older-first
             try:
                 new_games_sorted = sorted(new_games, key=lambda x: int(x.get("end_time", 0) or 0))
             except Exception:
                 new_games_sorted = new_games
 
-            # Build payload rows (objects)
             rows_payload = [convert_game_to_obj(username, archive, g) for g in new_games_sorted]
 
-            # Save to outputs folder
+            # Append to Google Sheets
             try:
-                out_file = save_rows_to_file(username, archive, rows_payload)
-                print(f"Saved {len(rows_payload)} new games from {archive} -> {out_file}")
+                print(f"Appending {len(rows_payload)} rows to Google Sheet (sheet id: {SHEET_ID})")
+                append_rows_to_sheet(username, rows_payload)
+                print("Append to Google Sheets succeeded")
             except Exception as e:
-                print(f"[ERROR] Failed to save output for {archive}: {e}")
-                # Do not mark archive processed so it'll be retried
+                print(f"[ERROR] Failed to append to Google Sheets for {archive}: {e}")
+                # do not mark archive processed so it can be retried
                 continue
 
-            # Update last_end_time: max end_time among sent games
+            # Optionally save outputs locally too (keeps previous behavior)
+            try:
+                out_dir = Path("outputs") / username
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"{archive_name_from_url(archive)}.json"
+                data = {"username": username, "archive_url": archive, "rows": rows_payload}
+                atomic_write_json(str(out_path), data)
+            except Exception as e:
+                print(f"[WARN] Failed to write local outputs: {e}")
+
+            # Update last_end_time
             max_end = last_end_time
             for g in new_games_sorted:
                 et = g.get("end_time")
@@ -253,8 +298,6 @@ def fetch_and_post(usernames_csv: str) -> None:
                 "processed_archives": sorted(list(processed_archives))
             }
             save_state(state)
-
-            # polite delay before next archive
             time.sleep(DELAY)
 
     print("\nDone. State saved to", STATE_FILE)
