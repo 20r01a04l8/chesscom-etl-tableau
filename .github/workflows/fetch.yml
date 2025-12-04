@@ -66,30 +66,68 @@ jobs:
             git commit -m "chore(state): add initial ${STATE_FILE}" || true
             git push origin HEAD || true
           fi
+
       - name: Debug - check secret presence (safe)
         shell: bash
         run: |
-              if [ -z "${{ secrets.GSPREAD_SERVICE_ACCOUNT_JSON_B64 }}" ]; then
-                echo "DEBUG: secret GSPREAD_SERVICE_ACCOUNT_JSON_B64 is EMPTY"
-                exit 1
-              fi
-              len=$(printf '%s' "${{ secrets.GSPREAD_SERVICE_ACCOUNT_JSON_B64 }}" | wc -c)
-              echo "DEBUG: secret GSPREAD_SERVICE_ACCOUNT_JSON_B64 exists; length=$len"
+          if [ -z "${{ secrets.GSPREAD_SERVICE_ACCOUNT_JSON_B64 }}" ]; then
+            echo "DEBUG: secret GSPREAD_SERVICE_ACCOUNT_JSON_B64 is EMPTY"
+            exit 1
+          fi
+          len=$(printf '%s' "${{ secrets.GSPREAD_SERVICE_ACCOUNT_JSON_B64 }}" | wc -c)
+          echo "DEBUG: secret GSPREAD_SERVICE_ACCOUNT_JSON_B64 exists; length=$len"
 
       - name: Decode service account secret to file
         shell: bash
         run: |
-            if [ -z "${{ secrets.GSPREAD_SERVICE_ACCOUNT_JSON_B64 }}" ]; then
-              echo "GSPREAD_SERVICE_ACCOUNT_JSON_B64 is empty - ensure secret is set (not available to fork PRs)."
-              exit 1
-            fi
-            printf '%s' "${{ secrets.GSPREAD_SERVICE_ACCOUNT_JSON_B64 }}" | base64 --decode > sa.json
-            if ! grep -q '"client_email"' sa.json; then
-              echo "Decoded file does not look like a service account JSON (missing client_email)."
-              exit 1
-            fi
-            echo "Decoded service account key to sa.json (runner-only)."
+          if [ -z "${{ secrets.GSPREAD_SERVICE_ACCOUNT_JSON_B64 }}" ]; then
+            echo "GSPREAD_SERVICE_ACCOUNT_JSON_B64 is empty - ensure secret is set (not available to fork PRs)."
+            exit 1
+          fi
+          printf '%s' "${{ secrets.GSPREAD_SERVICE_ACCOUNT_JSON_B64 }}" | base64 --decode > sa.json
+          if ! grep -q '"client_email"' sa.json; then
+            echo "Decoded file does not look like a service account JSON (missing client_email)."
+            exit 1
+          fi
+          echo "Decoded service account key to sa.json (runner-only)."
 
+      - name: Unmark last processed archive (auto)
+        # Removes the last element from each user's processed_archives in state.json so the latest archive is re-processed
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, json, sys
+          path = os.environ.get("STATE_FILE", "state.json")
+          if not os.path.exists(path):
+            print(f"State file not found ({path}) — nothing to unmark.")
+            sys.exit(0)
+          try:
+            with open(path, "r", encoding="utf-8") as f:
+              data = json.load(f) or {}
+          except Exception as e:
+            print(f"Failed to read state file {path}: {e}")
+            sys.exit(0)
+          changed = False
+          for user, obj in list(data.items()):
+            pa = obj.get("processed_archives", [])
+            if isinstance(pa, list) and pa:
+              removed = pa.pop()  # remove last processed archive
+              print(f"User '{user}': removed processed archive -> {removed}")
+              obj["processed_archives"] = pa
+              changed = True
+            else:
+              print(f"User '{user}': no processed_archives to remove")
+          if changed:
+            try:
+              with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+              print(f"Updated {path} (last processed archive removed for some users).")
+            except Exception as e:
+              print(f"Failed to write updated state file: {e}")
+              sys.exit(1)
+          else:
+            print("No changes made to state file.")
+          PY
 
       - name: Run fetch_and_post.py (writes to Google Sheets)
         run: |
