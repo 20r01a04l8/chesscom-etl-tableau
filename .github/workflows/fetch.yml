@@ -2,8 +2,7 @@ name: Chess.com Daily Fetch → Google Sheets
 
 on:
   schedule:
-    # Runs daily at 02:00 UTC (adjust cron as needed)
-    - cron: '0 2 * * *'
+    - cron: '0 2 * * *'       # daily at 02:00 UTC (adjust as needed)
   workflow_dispatch:
     inputs:
       usernames:
@@ -137,7 +136,6 @@ jobs:
             python fetch_and_post.py ""
           fi
         env:
-          # pass the path to the decoded SA JSON and sheet id to the script
           GSPREAD_SA_JSON_PATH: ./sa.json
           SHEET_ID: ${{ env.SHEET_ID }}
           SHEET_NAME_PREFIX: ${{ env.SHEET_NAME_PREFIX }}
@@ -147,17 +145,6 @@ jobs:
           STATE_FILE: ${{ env.STATE_FILE }}
           CHESS_USERNAMES: ${{ env.CHESS_USERNAMES }}
 
-      - name: Commit and push updated state.json and outputs (if changed)
-        run: |
-          git config user.name "github-actions[bot]" || true
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com" || true
-          git add "${{ env.STATE_FILE }}" outputs || true
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "chore: update state and outputs [ci skip]" || true
-            git push origin HEAD
-          fi
       - name: Commit and push updated state.json and outputs (if changed)
         shell: bash
         env:
@@ -179,7 +166,6 @@ jobs:
 
           git commit -m "chore: update state and outputs [ci skip]" || true
 
-          # Ensure we have credentials (actions/checkout with persist-credentials: true should do this)
           # Try to rebase with remote to avoid non-fast-forward
           echo "Attempting to pull --rebase from origin/${GIT_BRANCH} to avoid non-fast-forward push..."
           set +e
@@ -192,10 +178,7 @@ jobs:
           set -e
 
           if [ "$pull_ok" -ne 1 ]; then
-            echo "Warning: git pull --rebase failed. This can be due to merge conflicts or protected branch policies."
-            echo "To avoid accidental force-push, the workflow will skip pushing these changes."
-            echo "You can manually merge the changes or re-run the workflow after resolving remote changes."
-            # print status for debugging
+            echo "Warning: git pull --rebase failed. Skipping push to avoid non-fast-forward or conflicts."
             echo "==== git status ===="
             git status --porcelain --branch || true
             echo "==== git log (local vs origin) ===="
