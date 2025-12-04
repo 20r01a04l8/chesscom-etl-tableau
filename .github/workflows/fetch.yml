@@ -26,8 +26,6 @@ jobs:
     env:
       # CLI input or repository secret
       CHESS_USERNAMES: ${{ github.event.inputs.usernames || secrets.CHESS_USERNAMES || '' }}
-      # the service account key (base64 encoded) stored in repo secret
-      GSPREAD_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GSPREAD_SERVICE_ACCOUNT_JSON || '' }}
       SHEET_ID: ${{ secrets.SHEET_ID || '' }}
       SHEET_NAME_PREFIX: ${{ secrets.SHEET_NAME_PREFIX || '' }}
       MAKE_USER_AGENT: ${{ secrets.MAKE_USER_AGENT || 'ChessAnalytics/1.0 (+your-email@example.com)' }}
