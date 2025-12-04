@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 """
-fetch_and_post.py — Incremental fetcher for Chess.com archives.
+fetch_and_post.py — Incremental fetcher for Chess.com archives (Make removed).
 
-Behavior:
-- Tracks per-username `last_end_time` in state.json (seconds since epoch).
-- For each new archive not yet marked processed, downloads the archive,
-  filters games whose end_time > last_end_time, and POSTS only those games
-  to the Make webhook as an array-of-objects (keys match sheet headers).
-- Persists state (processed archives list + last_end_time) after each archive.
+Behavior changes:
+- No Make / webhook posting.
+- For each archive that contains new games, saves a JSON file to:
+    outputs/<username>/<archive_name>.json
+  where <archive_name> is the last path segment of the archive URL (e.g. 2025/11).
+- Persists state (processed_archives + last_end_time) after each archive.
 - Respects Chess.com politeness: delay between requests, exponential backoff for 429/5xx.
-- Dry-run mode if MAKE_WEBHOOK not set.
-
-Usage:
-- Provide usernames via CLI or via env CHESS_USERNAMES (used in GitHub Actions).
-  python fetch_and_post.py "konduvinay,another"
-  OR
-  CHESS_USERNAMES="konduvinay,another" python fetch_and_post.py ""
+- Dry-run concept removed; instead data is always saved locally to outputs.
 """
 
 from __future__ import annotations
@@ -34,10 +28,8 @@ USER_AGENT = os.environ.get("MAKE_USER_AGENT", DEFAULT_USER_AGENT)
 DELAY = float(os.environ.get("CHESS_REQUEST_DELAY", "1.0"))         # seconds between chess.com requests
 MAX_RETRIES = int(os.environ.get("CHESS_MAX_RETRIES", "3"))
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")            # path to state file (repo root)
-MAKE_WEBHOOK = os.environ.get("MAKE_WEBHOOK")
-MAKE_SECRET = os.environ.get("MAKE_SECRET")                        # optional secret header
-LEGACY_ARRAYS = os.environ.get("MAKE_SEND_AS_ARRAY_OF_ARRAYS", "") == "1"
-# Columns (must match your Google Sheet headers exactly)
+
+# Columns (must match your downstream target headers if you later import)
 SHEET_COLS = [
     "ingest_time", "username", "archive_url", "game_url", "time_control",
     "end_time_utc", "date_ymd", "white_username", "white_rating",
@@ -129,20 +121,33 @@ def convert_game_to_obj(username: str, archive_url: str, game: Dict[str, Any]) -
     row = convert_game_to_row(username, archive_url, game)
     return {SHEET_COLS[i]: row[i] for i in range(len(SHEET_COLS))}
 
-def post_to_make(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not MAKE_WEBHOOK:
-        print("[DRY RUN] MAKE_WEBHOOK not set. Payload (truncated):")
-        print(json.dumps(payload, indent=2, ensure_ascii=False)[:2000])
-        return {"dry_run": True}
-    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
-    if MAKE_SECRET:
-        headers["X-Hook-Token"] = MAKE_SECRET
-    r = requests.post(MAKE_WEBHOOK, json=payload, headers=headers, timeout=120)
-    r.raise_for_status()
+def archive_name_from_url(url: str) -> str:
+    # take last segment of URL and sanitize
+    name = url.rstrip("/").split("/")[-1]
+    # replace any characters that might be problematic in filenames
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+
+def save_rows_to_file(username: str, archive_url: str, rows: List[Dict[str, Any]]) -> str:
+    """
+    Save rows (list of objects) to outputs/<username>/<archive_name>.json
+    Returns the path where data was saved.
+    """
+    archive_name = archive_name_from_url(archive_url)
+    out_dir = Path("outputs") / username
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{archive_name}.json"
+    data = {
+        "username": username,
+        "archive_url": archive_url,
+        "game_count": len(rows),
+        "rows": rows,
+        "generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    }
     try:
-        return r.json()
-    except Exception:
-        return {"status": "ok", "http_status": r.status_code, "text": r.text[:200]}
+        atomic_write_json(str(out_path), data)
+        return str(out_path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to write output file {out_path}: {e}")
 
 # === Main logic ===
 def fetch_and_post(usernames_csv: str) -> None:
@@ -163,7 +168,12 @@ def fetch_and_post(usernames_csv: str) -> None:
         print(f"\n=== User: {username} (last_end_time={last_end_time}) ===")
 
         archives_url = f"https://api.chess.com/pub/player/{username}/games/archives"
-        archives_json = safe_get_json(archives_url)
+        try:
+            archives_json = safe_get_json(archives_url)
+        except Exception as e:
+            print(f"[ERROR] Could not fetch archives for {username}: {e}")
+            continue
+
         archives = archives_json.get("archives", []) or []
         print(f"Found {len(archives)} archives total")
 
@@ -171,7 +181,6 @@ def fetch_and_post(usernames_csv: str) -> None:
         for archive in archives:
             # Skip if archive already processed
             if archive in processed_archives:
-                # print(f"Skipping already processed archive {archive}")
                 continue
 
             print(f"Fetching archive: {archive}")
@@ -210,32 +219,22 @@ def fetch_and_post(usernames_csv: str) -> None:
                 save_state(state)
                 continue
 
-            # Sort new_games ascending by end_time so we send older-first
+            # Sort new_games ascending by end_time so we save older-first
             try:
                 new_games_sorted = sorted(new_games, key=lambda x: int(x.get("end_time", 0) or 0))
             except Exception:
                 new_games_sorted = new_games
 
-            # Build payload rows (objects preferred)
-            if LEGACY_ARRAYS:
-                rows_payload = [convert_game_to_row(username, archive, g) for g in new_games_sorted]
-            else:
-                rows_payload = [convert_game_to_obj(username, archive, g) for g in new_games_sorted]
+            # Build payload rows (objects)
+            rows_payload = [convert_game_to_obj(username, archive, g) for g in new_games_sorted]
 
-            payload = {
-                "username": username,
-                "archive_url": archive,
-                "game_count": len(rows_payload),
-                "rows": rows_payload
-            }
-
-            print(f"Posting {len(rows_payload)} new games from {archive} to Make webhook")
+            # Save to outputs folder
             try:
-                resp = post_to_make(payload)
-                print("Make response (trunc):", str(resp)[:400])
+                out_file = save_rows_to_file(username, archive, rows_payload)
+                print(f"Saved {len(rows_payload)} new games from {archive} -> {out_file}")
             except Exception as e:
-                print(f"[ERROR] Failed to POST to Make: {e}")
-                # do not mark archive processed so it'll be retried
+                print(f"[ERROR] Failed to save output for {archive}: {e}")
+                # Do not mark archive processed so it'll be retried
                 continue
 
             # Update last_end_time: max end_time among sent games
