@@ -1,97 +1,100 @@
-# .github/workflows/fetch.yml
-name: chess-fetch
+# .github/workflows/chess-daily-fetch.yml
+name: Chess.com Daily Fetch (no Make)
 
 on:
   schedule:
-    - cron: '0 1 * * *'  # daily at 01:00 UTC
+    # Runs daily at 02:00 UTC (adjust cron as needed)
+    - cron: '0 2 * * *'
   workflow_dispatch:
+    inputs:
+      usernames:
+        description: 'Comma-separated chess.com usernames (overrides secret CHESS_USERNAMES)'
+        required: false
+        default: ''
 
 permissions:
-  contents: write  # allow committing state.json back to the repo
+  contents: write
+
+concurrency:
+  group: chess-fetch
+  cancel-in-progress: true
 
 jobs:
-  fetch:
+  fetch-and-save:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # Provide sensible defaults or override via repo Secrets
+      CHESS_USERNAMES: ${{ github.event.inputs.usernames || secrets.CHESS_USERNAMES || '' }}
+      MAKE_USER_AGENT: ${{ secrets.MAKE_USER_AGENT || 'ChessAnalytics/1.0 (+your-email@example.com)' }}
+      CHESS_REQUEST_DELAY: ${{ secrets.CHESS_REQUEST_DELAY || '1.0' }}
+      CHESS_MAX_RETRIES: ${{ secrets.CHESS_MAX_RETRIES || '3' }}
+      STATE_FILE: ${{ secrets.STATE_FILE || 'state.json' }}
+
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true   # <-- allow git push using the runner token
+          persist-credentials: true
 
-      - name: Setup Python
+      - name: Set up Python 3.10
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-      - name: Pre-run diagnostics (show current state.json & git status)
+      - name: Install dependencies
         run: |
-          echo "Working dir: $(pwd)"
-          echo "Git status before run:"
-          git status --porcelain || true
-          echo "Current state.json (if exists):"
-          if [ -f state.json ]; then
-            echo "---- state.json start ----"
-            cat state.json || true
-            echo "---- state.json end ----"
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
           else
-            echo "(state.json not present)"
+            python -m pip install --upgrade pip
+            pip install requests
           fi
 
-      - name: Run fetcher
-        # Provide secrets & runtime config via environment variables
-        env:
-          MAKE_WEBHOOK: ${{ secrets.MAKE_WEBHOOK }}
-          MAKE_SECRET: ${{ secrets.MAKE_SECRET }}
-          CHESS_USERNAMES: ${{ secrets.CHESS_USERNAMES }}   # ensure this secret is configured
-          CHESS_REQUEST_DELAY: "1.0"
-          CHESS_MAX_RETRIES: "3"
-          STATE_FILE: "state.json"
-          # Optional: set to "1" to send legacy array-of-arrays instead of objects
-          # MAKE_SEND_AS_ARRAY_OF_ARRAYS: ${{ secrets.MAKE_SEND_AS_ARRAY_OF_ARRAYS }}
+      - name: Ensure STATE_FILE exists (initial)
         run: |
-          echo "Running fetch_and_post.py for usernames from secret CHESS_USERNAMES"
-          python fetch_and_post.py "${{ secrets.CHESS_USERNAMES }}"
-
-      - name: Post-run diagnostics (show modified state.json & git diff)
-        run: |
-          echo "Git status after script:"
-          git status --porcelain || true
-          echo "Diff (if any):"
-          git --no-pager diff --staged --name-only || true
-          echo "Current state.json (after run):"
-          if [ -f state.json ]; then
-            echo "---- state.json start ----"
-            cat state.json || true
-            echo "---- state.json end ----"
-          else
-            echo "(state.json not present)"
+          if [ ! -f "${{ env.STATE_FILE }}" ]; then
+            printf "{}" > "${{ env.STATE_FILE }}"
+            git add "${{ env.STATE_FILE }}" || true
+            git commit -m "chore(state): add initial ${STATE_FILE}" || true
+            git push origin HEAD || true
           fi
 
-      - name: Commit updated state.json
-        env:
-          GIT_AUTHOR_NAME: "github-actions[bot]"
-          GIT_AUTHOR_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Run fetch_and_save script
         run: |
-          git config user.name "$GIT_AUTHOR_NAME"
-          git config user.email "$GIT_AUTHOR_EMAIL"
-
-          # Stage all changes (makes sure new or removed file is picked up)
-          git add -A || true
-
-          # Only commit if there are staged changes
-          if ! git diff --staged --quiet --exit-code; then
-            git commit -m "Update processed archives (actions)" || true
-            echo "Attempting to push changes to remote..."
-            git push origin HEAD || {
-              echo "git push failed. Possible reasons: branch protection or insufficient permissions."
-              exit 0
-            }
+          # prefer CLI arg if workflow_dispatch input provided, otherwise rely on CHESS_USERNAMES env var
+          if [ -n "${{ github.event.inputs.usernames }}" ]; then
+            python fetch_and_post.py "${{ github.event.inputs.usernames }}"
           else
+            python fetch_and_post.py ""
+          fi
+        env:
+          MAKE_USER_AGENT: ${{ env.MAKE_USER_AGENT }}
+          CHESS_REQUEST_DELAY: ${{ env.CHESS_REQUEST_DELAY }}
+          CHESS_MAX_RETRIES: ${{ env.CHESS_MAX_RETRIES }}
+          STATE_FILE: ${{ env.STATE_FILE }}
+          CHESS_USERNAMES: ${{ env.CHESS_USERNAMES }}
+
+      - name: Commit and push updated state.json and outputs (if changed)
+        run: |
+          git config user.name "github-actions[bot]" || true
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com" || true
+          # add state file and outputs directory if changed
+          git add "${{ env.STATE_FILE }}" outputs || true
+          if git diff --cached --quiet; then
             echo "No changes to commit"
+          else
+            git commit -m "chore: update state and outputs [ci skip]" || true
+            git push origin HEAD
           fi
