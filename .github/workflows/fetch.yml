@@ -1,5 +1,4 @@
-# .github/workflows/chess-daily-fetch.yml
-name: Chess.com Daily Fetch (no Make)
+name: Chess.com Daily Fetch → Google Sheets
 
 on:
   schedule:
@@ -8,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       usernames:
-        description: 'Comma-separated chess.com usernames (overrides secret CHESS_USERNAMES)'
+        description: 'Comma-separated chess.com usernames (override secret CHESS_USERNAMES)'
         required: false
         default: ''
 
@@ -25,8 +24,12 @@ jobs:
     timeout-minutes: 30
 
     env:
-      # Provide sensible defaults or override via repo Secrets
+      # CLI input or repository secret
       CHESS_USERNAMES: ${{ github.event.inputs.usernames || secrets.CHESS_USERNAMES || '' }}
+      # the service account key (base64 encoded) stored in repo secret
+      GSPREAD_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GSPREAD_SERVICE_ACCOUNT_JSON || '' }}
+      SHEET_ID: ${{ secrets.SHEET_ID || '' }}
+      SHEET_NAME_PREFIX: ${{ secrets.SHEET_NAME_PREFIX || '' }}
       MAKE_USER_AGENT: ${{ secrets.MAKE_USER_AGENT || 'ChessAnalytics/1.0 (+your-email@example.com)' }}
       CHESS_REQUEST_DELAY: ${{ secrets.CHESS_REQUEST_DELAY || '1.0' }}
       CHESS_MAX_RETRIES: ${{ secrets.CHESS_MAX_RETRIES || '3' }}
@@ -54,13 +57,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          if [ -f requirements.txt ]; then
-            python -m pip install --upgrade pip
-            pip install -r requirements.txt
-          else
-            python -m pip install --upgrade pip
-            pip install requests
-          fi
+          python -m pip install --upgrade pip
+          pip install requests gspread google-auth
 
       - name: Ensure STATE_FILE exists (initial)
         run: |
@@ -71,15 +69,28 @@ jobs:
             git push origin HEAD || true
           fi
 
-      - name: Run fetch_and_save script
+      - name: Decode service account secret
+        # writes decoded JSON to ./sa.json for the script
         run: |
-          # prefer CLI arg if workflow_dispatch input provided, otherwise rely on CHESS_USERNAMES env var
+          if [ -z "${{ env.GSPREAD_SERVICE_ACCOUNT_JSON_B64 }}" ]; then
+            echo "GSPREAD_SERVICE_ACCOUNT_JSON_B64 is empty - ensure secret is set"
+            exit 1
+          fi
+          echo "${{ env.GSPREAD_SERVICE_ACCOUNT_JSON_B64 }}" | base64 --decode > sa.json
+        shell: bash
+
+      - name: Run fetch_and_post.py (writes to Google Sheets)
+        run: |
           if [ -n "${{ github.event.inputs.usernames }}" ]; then
             python fetch_and_post.py "${{ github.event.inputs.usernames }}"
           else
             python fetch_and_post.py ""
           fi
         env:
+          # pass the path to the decoded SA JSON and sheet id to the script
+          GSPREAD_SA_JSON_PATH: ./sa.json
+          SHEET_ID: ${{ env.SHEET_ID }}
+          SHEET_NAME_PREFIX: ${{ env.SHEET_NAME_PREFIX }}
           MAKE_USER_AGENT: ${{ env.MAKE_USER_AGENT }}
           CHESS_REQUEST_DELAY: ${{ env.CHESS_REQUEST_DELAY }}
           CHESS_MAX_RETRIES: ${{ env.CHESS_MAX_RETRIES }}
@@ -90,7 +101,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]" || true
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com" || true
-          # add state file and outputs directory if changed
           git add "${{ env.STATE_FILE }}" outputs || true
           if git diff --cached --quiet; then
             echo "No changes to commit"
