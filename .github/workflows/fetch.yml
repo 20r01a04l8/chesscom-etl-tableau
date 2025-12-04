@@ -158,3 +158,57 @@ jobs:
             git commit -m "chore: update state and outputs [ci skip]" || true
             git push origin HEAD
           fi
+      - name: Commit and push updated state.json and outputs (if changed)
+        shell: bash
+        env:
+          GIT_BRANCH: ${{ github.ref_name || 'main' }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]" || true
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com" || true
+
+          # Stage files (only those we intend to persist)
+          git add "${{ env.STATE_FILE }}" outputs || true
+
+          # Nothing to commit?
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "chore: update state and outputs [ci skip]" || true
+
+          # Ensure we have credentials (actions/checkout with persist-credentials: true should do this)
+          # Try to rebase with remote to avoid non-fast-forward
+          echo "Attempting to pull --rebase from origin/${GIT_BRANCH} to avoid non-fast-forward push..."
+          set +e
+          git fetch origin "${GIT_BRANCH}"
+          pull_ok=0
+          git pull --rebase --autostash origin "${GIT_BRANCH}"
+          if [ $? -eq 0 ]; then
+            pull_ok=1
+          fi
+          set -e
+
+          if [ "$pull_ok" -ne 1 ]; then
+            echo "Warning: git pull --rebase failed. This can be due to merge conflicts or protected branch policies."
+            echo "To avoid accidental force-push, the workflow will skip pushing these changes."
+            echo "You can manually merge the changes or re-run the workflow after resolving remote changes."
+            # print status for debugging
+            echo "==== git status ===="
+            git status --porcelain --branch || true
+            echo "==== git log (local vs origin) ===="
+            git --no-pager log --oneline --decorate --graph --all -n 20 || true
+            exit 0
+          fi
+
+          # Now push
+          echo "Pushing changes to origin/${GIT_BRANCH}..."
+          if git push origin "HEAD:${GIT_BRANCH}"; then
+            echo "Push succeeded."
+          else
+            echo "Push failed (non-fast-forward or permission). Not forcing a push for safety."
+            git status --porcelain --branch || true
+            exit 0
+          fi
