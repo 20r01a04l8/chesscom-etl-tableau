@@ -9,6 +9,8 @@ Behavior:
 - Writes processed archive records to ProceeedArchives with game_count = number appended.
 - Appends status messages to StatusLog.
 - Uses state.json in repo (workflow may pop the last processed archive each run).
+- Extracts canonical result (1-0, 0-1, 1/2-1/2) from PGN when available, otherwise falls back
+  to white_result / black_result.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import time
 import json
 import base64
 import requests
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Set
 
@@ -84,15 +87,62 @@ def safe_get_json(url: str) -> Any:
     raise RuntimeError(f"Failed to GET {url} after {MAX_RETRIES} retries")
 
 
+def parse_pgn_result(pgn: str) -> str:
+    """
+    Attempt to extract the game result from PGN.
+    Priority:
+      1) [Result "1-0"] header tag
+      2) trailing game token at the end of the PGN (e.g. '1-0', '0-1', '1/2-1/2')
+      3) empty string if nothing found
+    Returns canonical: "1-0", "0-1", or "1/2-1/2" (or empty string)
+    """
+    if not pgn:
+        return ""
+    # 1) look for Result header
+    m = re.search(r'\[Result\s+"([^"]+)"\]', pgn)
+    if m:
+        return m.group(1).strip()
+
+    # 2) search for a stand-alone result token anywhere (prefer the last occurrence)
+    tokens = re.findall(r'\b(1-0|0-1|1/2-1/2)\b', pgn)
+    if tokens:
+        return tokens[-1].strip()
+
+    return ""
+
+
 def convert_game_to_row(username: str, archive_url: str, game: Dict[str, Any]) -> List[Any]:
+    """
+    Build a row for the Games sheet. Result is extracted from PGN when possible.
+    """
     end_time = game.get("end_time")
     if end_time:
-        dt = datetime.utcfromtimestamp(int(end_time))
-        end_time_iso = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        date_ymd = dt.strftime("%Y-%m-%d")
+        try:
+            dt = datetime.utcfromtimestamp(int(end_time))
+            end_time_iso = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            date_ymd = dt.strftime("%Y-%m-%d")
+        except Exception:
+            end_time_iso = ""
+            date_ymd = ""
     else:
         end_time_iso = ""
         date_ymd = ""
+
+    pgn = game.get("pgn") or ""
+    # try to extract canonical result from PGN (1-0, 0-1, 1/2-1/2)
+    pgn_result = parse_pgn_result(pgn)
+
+    if pgn_result:
+        result_field = pgn_result
+    else:
+        # fallback to previous approach (white_result / black_result) to preserve behavior
+        white_res = (game.get("white", {}) or {}).get("result") or ""
+        black_res = (game.get("black", {}) or {}).get("result") or ""
+        if white_res or black_res:
+            result_field = f"{white_res} / {black_res}"
+        else:
+            result_field = ""
+
     row = [
         datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         username,
@@ -101,12 +151,12 @@ def convert_game_to_row(username: str, archive_url: str, game: Dict[str, Any]) -
         game.get("time_control") or "",
         end_time_iso,
         date_ymd,
-        game.get("white", {}).get("username") or "",
-        game.get("white", {}).get("rating") or "",
-        game.get("black", {}).get("username") or "",
-        game.get("black", {}).get("rating") or "",
-        (game.get("white", {}).get("result") or "") + " / " + (game.get("black", {}).get("result") or ""),
-        game.get("pgn") or ""
+        (game.get("white", {}) or {}).get("username") or "",
+        (game.get("white", {}) or {}).get("rating") or "",
+        (game.get("black", {}) or {}).get("username") or "",
+        (game.get("black", {}) or {}).get("rating") or "",
+        result_field,
+        pgn
     ]
     return row
 
