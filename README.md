@@ -1,4 +1,4 @@
-# ChessAnalytics — fetch & post Chess.com monthly archives to Make → Google Sheets
+# ChessAnalytics — fetch & post Chess.com monthly archives to Github Actions → Google Sheets
 
 ## Purpose
 Daily GitHub Action fetcher that:
